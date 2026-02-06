@@ -1,0 +1,6 @@
+{
+    "server_ip": null,
+    "port": 5000,
+    "discovery_port": 5001,
+    "mode": "auto"
+}

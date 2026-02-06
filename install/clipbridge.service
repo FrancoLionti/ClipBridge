@@ -1,0 +1,15 @@
+[Unit]
+Description=ClipBridge Clipboard Sync
+After=network.target graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/ClipBridge/clipbridge.py --client
+Restart=on-failure
+RestartSec=5
+User=YOUR_USERNAME
+
+[Install]
+WantedBy=default.target
