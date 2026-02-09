@@ -159,6 +159,35 @@ def clipboard_set(text):
     return True
 
 # ============================================================
+# EVENT-BASED CLIPBOARD MONITORING (Linux)
+# ============================================================
+
+def _has_clipnotify():
+    """Check if clipnotify is installed."""
+    try:
+        result = subprocess.run(['which', 'clipnotify'], capture_output=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def _wait_for_clipboard_change():
+    """Block until clipboard changes (Linux only, requires clipnotify).
+    
+    Returns True if clipboard changed, False on error/timeout.
+    """
+    try:
+        # clipnotify blocks until X selection changes, then exits
+        result = subprocess.run(['clipnotify'], timeout=30)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+
+# Global flag to track if we can use event-based monitoring
+USE_CLIPNOTIFY = sys.platform.startswith('linux') and _has_clipnotify()
+
+# ============================================================
 # LOGGING
 # ============================================================
 
@@ -320,10 +349,8 @@ def start_server():
 def client_sync_loop(server_ip):
     """Main client loop: push local changes, pull remote changes.
     
-    Uses smart polling to avoid interfering with typing:
-    - Configurable push interval (default 3 seconds)
-    - Direct xclip/wl-paste calls on Linux (less intrusive)
-    - Prioritizes pull operations (server -> client)
+    On Linux with clipnotify: Event-based (no polling, zero interference)
+    On Windows or without clipnotify: Polling-based with configurable interval
     """
     
     print("\n" + "=" * 50)
@@ -350,9 +377,71 @@ def client_sync_loop(server_ip):
         return
     
     log("✅ Sync active - Ctrl+C to stop")
-    log(f"ℹ️  Push interval: {PUSH_INTERVAL}s, Pull interval: {PULL_INTERVAL}s")
-    if sys.platform.startswith('linux'):
-        log("ℹ️  Using direct xclip/wl-paste (reduced typing interference)")
+    
+    if USE_CLIPNOTIFY:
+        log("🎯 Event-based monitoring (clipnotify) - ZERO typing interference")
+        _client_loop_event_based(server_ip)
+    else:
+        if sys.platform.startswith('linux'):
+            log("⚠️  clipnotify not found - using polling (run install/install_clipnotify.sh)")
+        log(f"ℹ️  Polling mode: push every {PUSH_INTERVAL}s, pull every {PULL_INTERVAL}s")
+        _client_loop_polling(server_ip)
+
+def _client_loop_event_based(server_ip):
+    """Event-based client loop using clipnotify (Linux only).
+    
+    Two threads:
+    - Main thread: waits for clipboard changes via clipnotify, then pushes
+    - Pull thread: polls server for incoming changes
+    """
+    print("=" * 50 + "\n")
+    
+    last_local = clipboard_get()
+    last_remote = ""
+    stop_event = threading.Event()
+    
+    def pull_thread():
+        """Background thread to pull from server."""
+        nonlocal last_remote, last_local
+        while not stop_event.is_set():
+            try:
+                resp = requests.get(f"http://{server_ip}:{PORT}/pull", timeout=2)
+                if resp.status_code == 200:
+                    remote_clip = resp.text
+                    if remote_clip and remote_clip != last_local and remote_clip != last_remote:
+                        clipboard_set(remote_clip)
+                        last_remote = remote_clip
+                        last_local = remote_clip
+                        log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
+            except Exception:
+                pass
+            time.sleep(PULL_INTERVAL)
+    
+    # Start pull thread
+    puller = threading.Thread(target=pull_thread, daemon=True)
+    puller.start()
+    
+    # Main loop: wait for clipboard changes
+    try:
+        while True:
+            if _wait_for_clipboard_change():
+                current = clipboard_get()
+                if current and current != last_local and current != last_remote:
+                    try:
+                        requests.post(
+                            f"http://{server_ip}:{PORT}/push",
+                            data=current.encode('utf-8'),
+                            timeout=2
+                        )
+                        last_local = current
+                        log(f"📤 SENT to server: {current[:40].replace(chr(10), ' ')}...")
+                    except Exception:
+                        pass
+    finally:
+        stop_event.set()
+
+def _client_loop_polling(server_ip):
+    """Polling-based client loop (fallback for Windows or when clipnotify unavailable)."""
     print("=" * 50 + "\n")
     
     last_local = clipboard_get()
@@ -362,16 +451,15 @@ def client_sync_loop(server_ip):
     while True:
         current_time = time.time()
         
-        # PUSH: Check local clipboard less frequently to avoid typing interference
+        # PUSH: Check local clipboard at configured interval
         if current_time - last_push_check >= PUSH_INTERVAL:
             last_push_check = current_time
             try:
                 current_local = clipboard_get()
                 if current_local and current_local != last_local and current_local != last_remote:
-                    # Wait a tiny bit to ensure clipboard is stable (user finished copying)
                     time.sleep(0.15)
                     confirm_local = clipboard_get()
-                    if confirm_local == current_local:  # Clipboard is stable
+                    if confirm_local == current_local:
                         requests.post(
                             f"http://{server_ip}:{PORT}/push",
                             data=current_local.encode('utf-8'),
@@ -382,7 +470,7 @@ def client_sync_loop(server_ip):
             except Exception:
                 pass
         
-        # PULL: Get remote changes (this doesn't interfere with typing)
+        # PULL: Get remote changes
         try:
             resp = requests.get(f"http://{server_ip}:{PORT}/pull", timeout=1)
             if resp.status_code == 200:
