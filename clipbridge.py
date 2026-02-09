@@ -29,7 +29,7 @@ if sys.platform.startswith('linux'):
 
 import pyperclip
 import requests
-from flask import Flask, request
+from flask import Flask, request, abort
 
 # ============================================================
 # CONFIGURATION
@@ -43,8 +43,12 @@ DEFAULT_CONFIG = {
     "port": 5000,
     "discovery_port": 5001,
     "mode": "auto",
-    "push_interval": 3.0,  # Seconds between clipboard checks (higher = less interference)
-    "pull_interval": 1.5   # Seconds between server pulls
+    "push_interval": 3.0,
+    "pull_interval": 1.5,
+    # Security settings
+    "secret_key": None,  # Shared secret for authentication (None = no auth)
+    "encryption_enabled": False,  # Encrypt clipboard data
+    "rate_limit": 10  # Max requests per second per IP
 }
 
 def load_config():
@@ -63,8 +67,131 @@ PORT = CONFIG["port"]
 DISCOVERY_PORT = CONFIG["discovery_port"]
 PUSH_INTERVAL = CONFIG.get("push_interval", 3.0)
 PULL_INTERVAL = CONFIG.get("pull_interval", 1.5)
+SECRET_KEY = CONFIG.get("secret_key")
+ENCRYPTION_ENABLED = CONFIG.get("encryption_enabled", False) and SECRET_KEY
+RATE_LIMIT = CONFIG.get("rate_limit", 10)
 DISCOVERY_MAGIC = b"CLIPBRIDGE_DISCOVER"
 DISCOVERY_RESPONSE = b"CLIPBRIDGE_SERVER"
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+import hashlib
+import hmac
+import base64
+from collections import defaultdict
+from functools import wraps
+
+# Optional: cryptography for encryption
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    if ENCRYPTION_ENABLED:
+        print("WARNING: cryptography not installed, encryption disabled")
+        print("  Install with: pip install cryptography")
+        ENCRYPTION_ENABLED = False
+
+class SecurityManager:
+    """Handles authentication and encryption for ClipBridge."""
+    
+    def __init__(self, secret_key, encryption_enabled=False):
+        self.secret_key = secret_key.encode() if secret_key else None
+        self.encryption_enabled = encryption_enabled and CRYPTO_AVAILABLE and self.secret_key
+        self.fernet = None
+        
+        if self.encryption_enabled:
+            # Derive encryption key from secret using PBKDF2
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'clipbridge_salt_v1',  # Fixed salt for simplicity
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(self.secret_key))
+            self.fernet = Fernet(key)
+    
+    def sign(self, data):
+        """Create HMAC signature for data."""
+        if not self.secret_key:
+            return ""
+        return hmac.new(self.secret_key, data.encode(), hashlib.sha256).hexdigest()
+    
+    def verify(self, data, signature):
+        """Verify HMAC signature."""
+        if not self.secret_key:
+            return True  # No auth configured
+        expected = self.sign(data)
+        return hmac.compare_digest(expected, signature)
+    
+    def encrypt(self, plaintext):
+        """Encrypt data if encryption is enabled."""
+        if not self.encryption_enabled:
+            return plaintext
+        return self.fernet.encrypt(plaintext.encode()).decode()
+    
+    def decrypt(self, ciphertext):
+        """Decrypt data if encryption is enabled."""
+        if not self.encryption_enabled:
+            return ciphertext
+        try:
+            return self.fernet.decrypt(ciphertext.encode()).decode()
+        except Exception:
+            return None
+
+# Initialize security manager
+security = SecurityManager(SECRET_KEY, ENCRYPTION_ENABLED)
+
+# Rate limiting
+request_counts = defaultdict(list)
+
+def rate_limit_check(ip):
+    """Check if IP has exceeded rate limit."""
+    import time
+    now = time.time()
+    # Clean old entries
+    request_counts[ip] = [t for t in request_counts[ip] if now - t < 1.0]
+    # Check limit
+    if len(request_counts[ip]) >= RATE_LIMIT:
+        return False
+    request_counts[ip].append(now)
+    return True
+
+def require_auth(f):
+    """Decorator to require authentication on endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Skip rate limiting in test mode
+        if not app.config.get('TESTING', False):
+            # Rate limit check
+            client_ip = request.remote_addr
+            if not rate_limit_check(client_ip):
+                return "Rate limit exceeded", 429
+        
+        # Auth check (skip if no secret configured)
+        if security.secret_key:
+            auth_header = request.headers.get('X-ClipBridge-Auth', '')
+            timestamp = request.headers.get('X-ClipBridge-Time', '0')
+            
+            # Verify timestamp is recent (within 60 seconds)
+            try:
+                req_time = float(timestamp)
+                if abs(time.time() - req_time) > 60:
+                    return "Request expired", 401
+            except ValueError:
+                return "Invalid timestamp", 401
+            
+            # Verify signature
+            data_to_sign = f"{timestamp}:{request.path}"
+            if not security.verify(data_to_sign, auth_header):
+                return "Unauthorized", 401
+        
+        return f(*args, **kwargs)
+    return decorated
 
 # ============================================================
 # CLIPBOARD ABSTRACTION (Linux-safe)
@@ -267,9 +394,16 @@ shared_clipboard = ""
 last_update_source = "init"
 
 @app.route('/push', methods=['POST'])
+@require_auth
 def push():
     global shared_clipboard, last_update_source
     incoming = request.data.decode('utf-8')
+    
+    # Decrypt if encryption is enabled
+    if ENCRYPTION_ENABLED:
+        incoming = security.decrypt(incoming)
+        if incoming is None:
+            return "Decryption failed", 400
     
     with clipboard_lock:
         if incoming != shared_clipboard:
@@ -281,12 +415,20 @@ def push():
     return "OK", 200
 
 @app.route('/pull', methods=['GET'])
+@require_auth
 def pull():
     with clipboard_lock:
-        return shared_clipboard
+        data = shared_clipboard
+    
+    # Encrypt if encryption is enabled
+    if ENCRYPTION_ENABLED:
+        data = security.encrypt(data)
+    
+    return data
 
 @app.route('/helo', methods=['GET'])
 def helo():
+    # helo doesn't require auth (used for discovery)
     return f"CLIPBRIDGE_SERVER:{get_local_ip()}", 200
 
 def server_clipboard_monitor():
@@ -338,6 +480,17 @@ def start_server():
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     
     log("✅ Server ready - waiting for clients...")
+    
+    # Log security status
+    if SECRET_KEY:
+        log("🔒 Authentication: ENABLED")
+        if ENCRYPTION_ENABLED:
+            log("🔐 Encryption: ENABLED (AES-256)")
+        else:
+            log("⚠️  Encryption: disabled (install cryptography)")
+    else:
+        log("⚠️  Security: disabled (set secret_key in config.json)")
+    
     print("=" * 50 + "\n")
     
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
@@ -345,6 +498,55 @@ def start_server():
 # ============================================================
 # CLIENT
 # ============================================================
+
+def _make_auth_headers(path):
+    """Create authentication headers for client requests."""
+    if not security.secret_key:
+        return {}
+    
+    timestamp = str(time.time())
+    data_to_sign = f"{timestamp}:{path}"
+    signature = security.sign(data_to_sign)
+    
+    return {
+        'X-ClipBridge-Auth': signature,
+        'X-ClipBridge-Time': timestamp
+    }
+
+def _client_push(server_ip, data):
+    """Push data to server with auth and encryption."""
+    # Encrypt if enabled
+    if ENCRYPTION_ENABLED:
+        data = security.encrypt(data)
+    
+    headers = _make_auth_headers('/push')
+    response = requests.post(
+        f"http://{server_ip}:{PORT}/push",
+        data=data.encode('utf-8'),
+        headers=headers,
+        timeout=2
+    )
+    return response.status_code == 200
+
+def _client_pull(server_ip):
+    """Pull data from server with auth and decryption."""
+    headers = _make_auth_headers('/pull')
+    response = requests.get(
+        f"http://{server_ip}:{PORT}/pull",
+        headers=headers,
+        timeout=2
+    )
+    
+    if response.status_code != 200:
+        return None
+    
+    data = response.text
+    
+    # Decrypt if enabled
+    if ENCRYPTION_ENABLED:
+        data = security.decrypt(data)
+    
+    return data
 
 def client_sync_loop(server_ip):
     """Main client loop: push local changes, pull remote changes.
@@ -378,6 +580,16 @@ def client_sync_loop(server_ip):
     
     log("✅ Sync active - Ctrl+C to stop")
     
+    # Log security status
+    if SECRET_KEY:
+        log("🔒 Authentication: ENABLED")
+        if ENCRYPTION_ENABLED:
+            log("🔐 Encryption: ENABLED (AES-256)")
+        else:
+            log("⚠️  Encryption: disabled (install cryptography)")
+    else:
+        log("⚠️  Security: disabled (no secret_key in config)")
+    
     if USE_CLIPNOTIFY:
         log("🎯 Event-based monitoring (clipnotify) - ZERO typing interference")
         _client_loop_event_based(server_ip)
@@ -405,14 +617,12 @@ def _client_loop_event_based(server_ip):
         nonlocal last_remote, last_local
         while not stop_event.is_set():
             try:
-                resp = requests.get(f"http://{server_ip}:{PORT}/pull", timeout=2)
-                if resp.status_code == 200:
-                    remote_clip = resp.text
-                    if remote_clip and remote_clip != last_local and remote_clip != last_remote:
-                        clipboard_set(remote_clip)
-                        last_remote = remote_clip
-                        last_local = remote_clip
-                        log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
+                remote_clip = _client_pull(server_ip)
+                if remote_clip and remote_clip != last_local and remote_clip != last_remote:
+                    clipboard_set(remote_clip)
+                    last_remote = remote_clip
+                    last_local = remote_clip
+                    log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
             except Exception:
                 pass
             time.sleep(PULL_INTERVAL)
@@ -428,13 +638,9 @@ def _client_loop_event_based(server_ip):
                 current = clipboard_get()
                 if current and current != last_local and current != last_remote:
                     try:
-                        requests.post(
-                            f"http://{server_ip}:{PORT}/push",
-                            data=current.encode('utf-8'),
-                            timeout=2
-                        )
-                        last_local = current
-                        log(f"📤 SENT to server: {current[:40].replace(chr(10), ' ')}...")
+                        if _client_push(server_ip, current):
+                            last_local = current
+                            log(f"📤 SENT to server: {current[:40].replace(chr(10), ' ')}...")
                     except Exception:
                         pass
     finally:
@@ -460,26 +666,20 @@ def _client_loop_polling(server_ip):
                     time.sleep(0.15)
                     confirm_local = clipboard_get()
                     if confirm_local == current_local:
-                        requests.post(
-                            f"http://{server_ip}:{PORT}/push",
-                            data=current_local.encode('utf-8'),
-                            timeout=2
-                        )
-                        last_local = current_local
-                        log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
+                        if _client_push(server_ip, current_local):
+                            last_local = current_local
+                            log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
             except Exception:
                 pass
         
         # PULL: Get remote changes
         try:
-            resp = requests.get(f"http://{server_ip}:{PORT}/pull", timeout=1)
-            if resp.status_code == 200:
-                remote_clip = resp.text
-                if remote_clip and remote_clip != last_local and remote_clip != last_remote:
-                    clipboard_set(remote_clip)
-                    last_remote = remote_clip
-                    last_local = remote_clip
-                    log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
+            remote_clip = _client_pull(server_ip)
+            if remote_clip and remote_clip != last_local and remote_clip != last_remote:
+                clipboard_set(remote_clip)
+                last_remote = remote_clip
+                last_local = remote_clip
+                log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
         except Exception:
             pass
         
