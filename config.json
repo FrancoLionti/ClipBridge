@@ -3,6 +3,9 @@
     "port": 5000,
     "discovery_port": 5001,
     "mode": "auto",
+    "push_interval": 3.0,
+    "pull_interval": 1.5,
     "secret_key": "mondongoRACING123",
-    "encryption_enabled": true
+    "encryption_enabled": true,
+    "rate_limit": 10
 }

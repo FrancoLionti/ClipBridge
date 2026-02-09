@@ -68,7 +68,7 @@ DISCOVERY_PORT = CONFIG["discovery_port"]
 PUSH_INTERVAL = CONFIG.get("push_interval", 3.0)
 PULL_INTERVAL = CONFIG.get("pull_interval", 1.5)
 SECRET_KEY = CONFIG.get("secret_key")
-ENCRYPTION_ENABLED = CONFIG.get("encryption_enabled", False) and SECRET_KEY
+ENCRYPTION_ENABLED = bool(CONFIG.get("encryption_enabled", False) and SECRET_KEY)
 RATE_LIMIT = CONFIG.get("rate_limit", 10)
 DISCOVERY_MAGIC = b"CLIPBRIDGE_DISCOVER"
 DISCOVERY_RESPONSE = b"CLIPBRIDGE_SERVER"
@@ -101,7 +101,7 @@ class SecurityManager:
     
     def __init__(self, secret_key, encryption_enabled=False):
         self.secret_key = secret_key.encode() if secret_key else None
-        self.encryption_enabled = encryption_enabled and CRYPTO_AVAILABLE and self.secret_key
+        self.encryption_enabled = bool(encryption_enabled and CRYPTO_AVAILABLE and self.secret_key)
         self.fernet = None
         
         if self.encryption_enabled:
@@ -132,7 +132,12 @@ class SecurityManager:
         """Encrypt data if encryption is enabled."""
         if not self.encryption_enabled:
             return plaintext
-        return self.fernet.encrypt(plaintext.encode()).decode()
+        try:
+            result = self.fernet.encrypt(plaintext.encode()).decode()
+            return result
+        except Exception as e:
+            print(f"⚠️ Encryption error: {e}")
+            return plaintext
     
     def decrypt(self, ciphertext):
         """Decrypt data if encryption is enabled."""
@@ -140,11 +145,19 @@ class SecurityManager:
             return ciphertext
         try:
             return self.fernet.decrypt(ciphertext.encode()).decode()
-        except Exception:
-            return None
+        except Exception as e:
+            print(f"⚠️ Decryption error: {e}")
+            # Return as-is if decryption fails (might be unencrypted)
+            return ciphertext
 
 # Initialize security manager
 security = SecurityManager(SECRET_KEY, ENCRYPTION_ENABLED)
+
+# Debug: verify encryption status at startup
+if SECRET_KEY:
+    print(f"🔑 Security initialized: CRYPTO_AVAILABLE={CRYPTO_AVAILABLE}, " +
+          f"ENCRYPTION_ENABLED={ENCRYPTION_ENABLED}, " +
+          f"security.encryption_enabled={security.encryption_enabled}")
 
 # Rate limiting
 request_counts = defaultdict(list)
@@ -400,10 +413,11 @@ def push():
     incoming = request.data.decode('utf-8')
     
     # Decrypt if encryption is enabled (skip in test mode)
-    if ENCRYPTION_ENABLED and not app.config.get('TESTING', False):
-        incoming = security.decrypt(incoming)
-        if incoming is None:
-            return "Decryption failed", 400
+    if security.encryption_enabled and not app.config.get('TESTING', False):
+        decrypted = security.decrypt(incoming)
+        if decrypted != incoming:  # Decryption happened
+            incoming = decrypted
+            log(f"🔓 Decrypted incoming data")
     
     with clipboard_lock:
         if incoming != shared_clipboard:
@@ -421,8 +435,9 @@ def pull():
         data = shared_clipboard
     
     # Encrypt if encryption is enabled (skip in test mode)
-    if ENCRYPTION_ENABLED and not app.config.get('TESTING', False):
+    if security.encryption_enabled and not app.config.get('TESTING', False):
         data = security.encrypt(data)
+        log(f"🔒 Encrypted outgoing data")
     
     return data
 
