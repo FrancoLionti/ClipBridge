@@ -42,7 +42,9 @@ DEFAULT_CONFIG = {
     "server_ip": None,
     "port": 5000,
     "discovery_port": 5001,
-    "mode": "auto"
+    "mode": "auto",
+    "push_interval": 3.0,  # Seconds between clipboard checks (higher = less interference)
+    "pull_interval": 1.5   # Seconds between server pulls
 }
 
 def load_config():
@@ -59,8 +61,102 @@ def load_config():
 CONFIG = load_config()
 PORT = CONFIG["port"]
 DISCOVERY_PORT = CONFIG["discovery_port"]
+PUSH_INTERVAL = CONFIG.get("push_interval", 3.0)
+PULL_INTERVAL = CONFIG.get("pull_interval", 1.5)
 DISCOVERY_MAGIC = b"CLIPBRIDGE_DISCOVER"
 DISCOVERY_RESPONSE = b"CLIPBRIDGE_SERVER"
+
+# ============================================================
+# CLIPBOARD ABSTRACTION (Linux-safe)
+# ============================================================
+
+import subprocess
+
+def _linux_get_clipboard():
+    """Get clipboard on Linux using xclip directly (less intrusive than pyperclip)."""
+    try:
+        # Try xclip first (X11)
+        result = subprocess.run(
+            ['xclip', '-selection', 'clipboard', '-o'],
+            capture_output=True, text=True, timeout=1
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    try:
+        # Try wl-paste for Wayland
+        result = subprocess.run(
+            ['wl-paste', '--no-newline'],
+            capture_output=True, text=True, timeout=1
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback to pyperclip
+    return pyperclip.paste()
+
+def _linux_set_clipboard(text):
+    """Set clipboard on Linux using xclip directly."""
+    try:
+        # Try xclip first (X11)
+        process = subprocess.Popen(
+            ['xclip', '-selection', 'clipboard'],
+            stdin=subprocess.PIPE
+        )
+        process.communicate(input=text.encode('utf-8'), timeout=1)
+        if process.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    try:
+        # Try wl-copy for Wayland
+        process = subprocess.Popen(
+            ['wl-copy'],
+            stdin=subprocess.PIPE
+        )
+        process.communicate(input=text.encode('utf-8'), timeout=1)
+        if process.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    
+    # Fallback to pyperclip
+    pyperclip.copy(text)
+    return True
+
+def clipboard_get():
+    """Cross-platform clipboard get."""
+    if sys.platform.startswith('linux'):
+        return _linux_get_clipboard()
+    return pyperclip.paste()
+
+def clipboard_set(text):
+    """Cross-platform clipboard set."""
+    if sys.platform.startswith('linux'):
+        return _linux_set_clipboard(text)
+    pyperclip.copy(text)
+    return True
 
 # ============================================================
 # LOGGING
@@ -150,7 +246,7 @@ def push():
         if incoming != shared_clipboard:
             shared_clipboard = incoming
             last_update_source = "remote"
-            pyperclip.copy(incoming)
+            clipboard_set(incoming)
             log(f"📥 RECV from client: {incoming[:40].replace(chr(10), ' ')}...")
     
     return "OK", 200
@@ -168,12 +264,12 @@ def server_clipboard_monitor():
     """Monitor local clipboard and update shared state."""
     global shared_clipboard, last_update_source
     
-    last_local = pyperclip.paste()
+    last_local = clipboard_get()
     log("🔄 Clipboard monitor active")
     
     while True:
         try:
-            current = pyperclip.paste()
+            current = clipboard_get()
             
             with clipboard_lock:
                 if current != last_local:
@@ -198,7 +294,7 @@ def start_server():
     print("=" * 50)
     log(f"🚀 Server starting on {local_ip}:{PORT}")
     
-    shared_clipboard = pyperclip.paste()
+    shared_clipboard = clipboard_get()
     
     # Start discovery responder
     discovery_thread = threading.Thread(target=discovery_responder, daemon=True)
@@ -225,8 +321,8 @@ def client_sync_loop(server_ip):
     """Main client loop: push local changes, pull remote changes.
     
     Uses smart polling to avoid interfering with typing:
-    - Longer base interval (2 seconds)
-    - Only reads clipboard occasionally for push
+    - Configurable push interval (default 3 seconds)
+    - Direct xclip/wl-paste calls on Linux (less intrusive)
     - Prioritizes pull operations (server -> client)
     """
     
@@ -254,27 +350,27 @@ def client_sync_loop(server_ip):
         return
     
     log("✅ Sync active - Ctrl+C to stop")
-    log("ℹ️  Smart polling enabled (reduced interference with typing)")
+    log(f"ℹ️  Push interval: {PUSH_INTERVAL}s, Pull interval: {PULL_INTERVAL}s")
+    if sys.platform.startswith('linux'):
+        log("ℹ️  Using direct xclip/wl-paste (reduced typing interference)")
     print("=" * 50 + "\n")
     
-    last_local = pyperclip.paste()
+    last_local = clipboard_get()
     last_remote = ""
     last_push_check = 0
-    push_check_interval = 2.0  # Only check local clipboard every 2 seconds
-    pull_interval = 1.5  # Check server more frequently for incoming changes
     
     while True:
         current_time = time.time()
         
         # PUSH: Check local clipboard less frequently to avoid typing interference
-        if current_time - last_push_check >= push_check_interval:
+        if current_time - last_push_check >= PUSH_INTERVAL:
             last_push_check = current_time
             try:
-                current_local = pyperclip.paste()
-                if current_local != last_local and current_local != last_remote:
+                current_local = clipboard_get()
+                if current_local and current_local != last_local and current_local != last_remote:
                     # Wait a tiny bit to ensure clipboard is stable (user finished copying)
-                    time.sleep(0.1)
-                    confirm_local = pyperclip.paste()
+                    time.sleep(0.15)
+                    confirm_local = clipboard_get()
                     if confirm_local == current_local:  # Clipboard is stable
                         requests.post(
                             f"http://{server_ip}:{PORT}/push",
@@ -292,14 +388,14 @@ def client_sync_loop(server_ip):
             if resp.status_code == 200:
                 remote_clip = resp.text
                 if remote_clip and remote_clip != last_local and remote_clip != last_remote:
-                    pyperclip.copy(remote_clip)
+                    clipboard_set(remote_clip)
                     last_remote = remote_clip
                     last_local = remote_clip
                     log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
         except Exception:
             pass
         
-        time.sleep(pull_interval)
+        time.sleep(PULL_INTERVAL)
 
 def start_client():
     # Check for manual IP in config
