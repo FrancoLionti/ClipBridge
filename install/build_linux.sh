@@ -20,9 +20,18 @@ echo "Installing dependencies..."
 pip3 install -r requirements.txt
 pip3 install pyinstaller
 
-# Build executable
+# Build executable (excluding Qt packages we don't need)
 echo "Building executable..."
-pyinstaller --onefile --name clipbridge --console clipbridge.py
+python3 -m PyInstaller --onefile --name clipbridge --console \
+    --exclude-module PyQt5 \
+    --exclude-module PyQt6 \
+    --exclude-module PySide2 \
+    --exclude-module PySide6 \
+    --exclude-module tkinter \
+    --exclude-module matplotlib \
+    --exclude-module numpy \
+    --exclude-module IPython \
+    clipbridge.py
 
 # Move to dist folder
 if [ -f "dist/clipbridge" ]; then

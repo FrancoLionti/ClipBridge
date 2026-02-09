@@ -14,6 +14,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# ============================================================
+# LINUX: Prevent ghost windows from clipboard access
+# ============================================================
+if sys.platform.startswith('linux'):
+    # Force xclip/xsel backend instead of GTK/Qt which can create windows
+    os.environ.setdefault('PYPERCLIP_BACKEND', 'xclip')
+    # Prevent GTK from creating windows
+    os.environ.setdefault('GDK_BACKEND', 'x11')
+    # Suppress GTK accessibility warnings
+    os.environ.setdefault('NO_AT_BRIDGE', '1')
+    # Hide from desktop/taskbar
+    os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
+
 import pyperclip
 import requests
 from flask import Flask, request
