@@ -209,7 +209,13 @@ def start_server():
 # ============================================================
 
 def client_sync_loop(server_ip):
-    """Main client loop: push local changes, pull remote changes."""
+    """Main client loop: push local changes, pull remote changes.
+    
+    Uses smart polling to avoid interfering with typing:
+    - Longer base interval (2 seconds)
+    - Only reads clipboard occasionally for push
+    - Prioritizes pull operations (server -> client)
+    """
     
     print("\n" + "=" * 50)
     print("   CLIPBRIDGE CLIENT")
@@ -235,27 +241,39 @@ def client_sync_loop(server_ip):
         return
     
     log("✅ Sync active - Ctrl+C to stop")
+    log("ℹ️  Smart polling enabled (reduced interference with typing)")
     print("=" * 50 + "\n")
     
     last_local = pyperclip.paste()
     last_remote = ""
+    last_push_check = 0
+    push_check_interval = 2.0  # Only check local clipboard every 2 seconds
+    pull_interval = 1.5  # Check server more frequently for incoming changes
     
     while True:
-        # PUSH: Send local changes
-        try:
-            current_local = pyperclip.paste()
-            if current_local != last_local and current_local != last_remote:
-                requests.post(
-                    f"http://{server_ip}:{PORT}/push",
-                    data=current_local.encode('utf-8'),
-                    timeout=2
-                )
-                last_local = current_local
-                log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
-        except Exception:
-            pass
+        current_time = time.time()
         
-        # PULL: Get remote changes
+        # PUSH: Check local clipboard less frequently to avoid typing interference
+        if current_time - last_push_check >= push_check_interval:
+            last_push_check = current_time
+            try:
+                current_local = pyperclip.paste()
+                if current_local != last_local and current_local != last_remote:
+                    # Wait a tiny bit to ensure clipboard is stable (user finished copying)
+                    time.sleep(0.1)
+                    confirm_local = pyperclip.paste()
+                    if confirm_local == current_local:  # Clipboard is stable
+                        requests.post(
+                            f"http://{server_ip}:{PORT}/push",
+                            data=current_local.encode('utf-8'),
+                            timeout=2
+                        )
+                        last_local = current_local
+                        log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
+            except Exception:
+                pass
+        
+        # PULL: Get remote changes (this doesn't interfere with typing)
         try:
             resp = requests.get(f"http://{server_ip}:{PORT}/pull", timeout=1)
             if resp.status_code == 200:
@@ -268,7 +286,7 @@ def client_sync_loop(server_ip):
         except Exception:
             pass
         
-        time.sleep(0.8)
+        time.sleep(pull_interval)
 
 def start_client():
     # Check for manual IP in config
