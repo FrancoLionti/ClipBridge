@@ -153,12 +153,6 @@ class SecurityManager:
 # Initialize security manager
 security = SecurityManager(SECRET_KEY, ENCRYPTION_ENABLED)
 
-# Debug: verify encryption status at startup
-if SECRET_KEY:
-    print(f"🔑 Security initialized: CRYPTO_AVAILABLE={CRYPTO_AVAILABLE}, " +
-          f"ENCRYPTION_ENABLED={ENCRYPTION_ENABLED}, " +
-          f"security.encryption_enabled={security.encryption_enabled}")
-
 # Rate limiting
 request_counts = defaultdict(list)
 
@@ -202,7 +196,7 @@ def require_auth(f):
             data_to_sign = f"{timestamp}:{request.path}"
             if not security.verify(data_to_sign, auth_header):
                 return "Unauthorized", 401
-        
+            
         return f(*args, **kwargs)
     return decorated
 
@@ -437,7 +431,6 @@ def pull():
     # Encrypt if encryption is enabled (skip in test mode)
     if security.encryption_enabled and not app.config.get('TESTING', False):
         data = security.encrypt(data)
-        log(f"🔒 Encrypted outgoing data")
     
     return data
 
@@ -479,6 +472,16 @@ def start_server():
     print("   CLIPBRIDGE SERVER")
     print("=" * 50)
     log(f"🚀 Server starting on {local_ip}:{PORT}")
+    
+    # Check if port is already in use
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('0.0.0.0', PORT))
+        sock.close()
+    except OSError:
+        log(f"❌ Error: Port {PORT} is already in use!")
+        log("   Is ClipBridge already running?")
+        sys.exit(1)
     
     shared_clipboard = clipboard_get()
     
