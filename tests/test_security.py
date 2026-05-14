@@ -110,6 +110,12 @@ class TestAuthenticatedEndpoints:
         """GET /pull should work when no secret is configured."""
         response = server_client.get('/pull')
         assert response.status_code == 200
+
+    def test_pull_wait_without_auth_works_when_no_secret(self, server_client, mock_clipboard):
+        """GET /pull_wait should work when no secret is configured."""
+        response = server_client.get("/pull_wait?since=-1")
+        assert response.status_code == 200
+        assert "X-ClipBridge-Rev" in response.headers
     
     def test_helo_always_works(self, server_client):
         """GET /helo should always work (no auth required)."""

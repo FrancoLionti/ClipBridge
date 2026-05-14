@@ -86,6 +86,33 @@ class TestServerEndpoints:
         response = server_client.post('/push', data=b'')
         assert response.status_code == 200
 
+    def test_pull_wait_immediate_when_since_negative(self, server_client, mock_clipboard):
+        """GET /pull_wait?since=-1 should return immediately with current payload and rev."""
+        import clipbridge
+
+        with clipbridge.clipboard_condition:
+            clipbridge.shared_clipboard = "snap"
+            clipbridge.clipboard_rev = 7
+
+        response = server_client.get("/pull_wait?since=-1")
+        assert response.status_code == 200
+        assert response.headers.get("X-ClipBridge-Rev") == "7"
+        assert response.data.decode("utf-8") == "snap"
+
+    def test_pull_wait_rev_advances_after_push(self, server_client, mock_clipboard):
+        """Revision header should increase when new data is pushed."""
+        server_client.post("/push", data=b"one")
+        r1 = server_client.get("/pull_wait?since=-1")
+        rev1 = int(r1.headers["X-ClipBridge-Rev"])
+        assert r1.data.decode("utf-8") == "one"
+        assert rev1 >= 1
+
+        server_client.post("/push", data=b"two")
+        r2 = server_client.get("/pull_wait?since=-1")
+        rev2 = int(r2.headers["X-ClipBridge-Rev"])
+        assert rev2 > rev1
+        assert r2.data.decode("utf-8") == "two"
+
 
 class TestDataIntegrity:
     """Tests for data integrity during sync."""

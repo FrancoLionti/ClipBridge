@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 ClipBridge - Cross-platform clipboard synchronization
-https://github.com/YOUR_USERNAME/ClipBridge
+https://github.com/FrancoLionti/ClipBridge
 """
+
+__version__ = "2.0.0"
 
 import argparse
 import json
@@ -29,7 +31,7 @@ if sys.platform.startswith('linux'):
 
 import pyperclip
 import requests
-from flask import Flask, request, abort
+from flask import Flask, request, abort, Response
 
 # ============================================================
 # CONFIGURATION
@@ -292,6 +294,16 @@ def clipboard_set(text):
     pyperclip.copy(text)
     return True
 
+
+def _clip_sync_equal(a, b):
+    """Whether two clipboard strings are the same for sync (avoids xclip/Wayland newline quirks)."""
+    sa = "" if a is None else a
+    sb = "" if b is None else b
+    if sa == sb:
+        return True
+    return sa.rstrip("\r\n") == sb.rstrip("\r\n")
+
+
 # ============================================================
 # EVENT-BASED CLIPBOARD MONITORING (Linux)
 # ============================================================
@@ -396,14 +408,15 @@ def discover_server(timeout=5):
 # ============================================================
 
 app = Flask(__name__)
-clipboard_lock = threading.Lock()
+clipboard_condition = threading.Condition()
 shared_clipboard = ""
+clipboard_rev = 0
 last_update_source = "init"
 
 @app.route('/push', methods=['POST'])
 @require_auth
 def push():
-    global shared_clipboard, last_update_source
+    global shared_clipboard, last_update_source, clipboard_rev
     incoming = request.data.decode('utf-8')
     
     # Decrypt if encryption is enabled (skip in test mode)
@@ -413,11 +426,13 @@ def push():
             incoming = decrypted
             log(f"🔓 Decrypted incoming data")
     
-    with clipboard_lock:
+    with clipboard_condition:
         if incoming != shared_clipboard:
             shared_clipboard = incoming
+            clipboard_rev += 1
             last_update_source = "remote"
             clipboard_set(incoming)
+            clipboard_condition.notify_all()
             log(f"📥 RECV from client: {incoming[:40].replace(chr(10), ' ')}...")
     
     return "OK", 200
@@ -425,7 +440,7 @@ def push():
 @app.route('/pull', methods=['GET'])
 @require_auth
 def pull():
-    with clipboard_lock:
+    with clipboard_condition:
         data = shared_clipboard
     
     # Encrypt if encryption is enabled (skip in test mode)
@@ -434,6 +449,53 @@ def pull():
     
     return data
 
+
+@app.route('/pull_wait', methods=['GET'])
+@require_auth
+def pull_wait():
+    """Long-poll: block until shared clipboard revision advances past ``since`` (or timeout).
+
+    Query params:
+      since: last revision seen by client; use -1 for an immediate snapshot (no wait).
+      timeout: max seconds to wait (0.5–60, default 30).
+    Response header: X-ClipBridge-Rev — current revision after wait.
+    """
+    try:
+        since = int(request.args.get("since", "-1"))
+    except ValueError:
+        since = -1
+    try:
+        timeout_s = float(request.args.get("timeout", "30"))
+    except ValueError:
+        timeout_s = 30.0
+    timeout_s = max(0.5, min(timeout_s, 60.0))
+
+    deadline = time.time() + timeout_s
+
+    with clipboard_condition:
+        if since < 0:
+            payload = shared_clipboard
+            rev_out = clipboard_rev
+        else:
+            while clipboard_rev <= since:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                clipboard_condition.wait(timeout=remaining)
+            payload = shared_clipboard
+            rev_out = clipboard_rev
+
+    if security.encryption_enabled and not app.config.get("TESTING", False):
+        payload = security.encrypt(payload)
+
+    body = payload if isinstance(payload, (bytes, bytearray)) else (payload or "")
+    return Response(
+        body,
+        status=200,
+        headers={"X-ClipBridge-Rev": str(rev_out)},
+        mimetype="text/plain",
+    )
+
 @app.route('/helo', methods=['GET'])
 def helo():
     # helo doesn't require auth (used for discovery)
@@ -441,7 +503,7 @@ def helo():
 
 def server_clipboard_monitor():
     """Monitor local clipboard and update shared state."""
-    global shared_clipboard, last_update_source
+    global shared_clipboard, last_update_source, clipboard_rev
     
     last_local = clipboard_get()
     log("🔄 Clipboard monitor active")
@@ -450,11 +512,15 @@ def server_clipboard_monitor():
         try:
             current = clipboard_get()
             
-            with clipboard_lock:
+            with clipboard_condition:
                 if current != last_local:
                     if last_update_source != "remote" or current != shared_clipboard:
+                        old = shared_clipboard
                         shared_clipboard = current
                         last_update_source = "local"
+                        if current != old:
+                            clipboard_rev += 1
+                            clipboard_condition.notify_all()
                         log(f"📋 LOCAL copy: {current[:40].replace(chr(10), ' ')}...")
                     last_local = current
                     
@@ -464,7 +530,7 @@ def server_clipboard_monitor():
         time.sleep(0.8)
 
 def start_server():
-    global shared_clipboard
+    global shared_clipboard, clipboard_rev
     
     local_ip = get_local_ip()
     
@@ -483,7 +549,10 @@ def start_server():
         log("   Is ClipBridge already running?")
         sys.exit(1)
     
-    shared_clipboard = clipboard_get()
+    with clipboard_condition:
+        shared_clipboard = clipboard_get()
+        clipboard_rev = 1
+        clipboard_condition.notify_all()
     
     # Start discovery responder
     discovery_thread = threading.Thread(target=discovery_responder, daemon=True)
@@ -566,11 +635,48 @@ def _client_pull(server_ip):
     
     return data
 
+
+def _client_pull_wait(server_ip, since_rev):
+    """Block until the server's clipboard revision advances past ``since_rev`` (or timeout).
+
+    Returns ``(text, new_rev)``. ``new_rev`` is None on network/HTTP failure — caller
+    should retry with a short backoff. ``since_rev`` of ``-1`` always returns immediately
+    with the current snapshot (used for the first request).
+    """
+    headers = _make_auth_headers('/pull_wait')
+    try:
+        response = requests.get(
+            f"http://{server_ip}:{PORT}/pull_wait",
+            params={"since": since_rev, "timeout": 30},
+            headers=headers,
+            timeout=35,
+        )
+    except requests.RequestException:
+        return None, None
+
+    if response.status_code != 200:
+        return None, None
+
+    try:
+        new_rev = int(response.headers.get("X-ClipBridge-Rev", ""))
+    except ValueError:
+        new_rev = None
+
+    data = response.text
+    if ENCRYPTION_ENABLED:
+        data = security.decrypt(data)
+
+    return data, new_rev
+
 def client_sync_loop(server_ip):
     """Main client loop: push local changes, pull remote changes.
-    
-    On Linux with clipnotify: Event-based (no polling, zero interference)
-    On Windows or without clipnotify: Polling-based with configurable interval
+
+    Local clipboard:
+      Linux + clipnotify: event-based (no polling).
+      Otherwise: polling on ``push_interval``.
+
+    Remote clipboard: long-poll ``/pull_wait`` (blocks until the server has something
+    new, or a timeout). No periodic GET storm to ``/pull``.
     """
     
     print("\n" + "=" * 50)
@@ -609,41 +715,50 @@ def client_sync_loop(server_ip):
         log("⚠️  Security: disabled (no secret_key in config)")
     
     if USE_CLIPNOTIFY:
-        log("🎯 Event-based monitoring (clipnotify) - ZERO typing interference")
+        log("🎯 Local clipboard: clipnotify (event-based, no polling)")
+        log("📡 Remote clipboard: long-poll /pull_wait (blocked until server updates)")
         _client_loop_event_based(server_ip)
     else:
         if sys.platform.startswith('linux'):
-            log("⚠️  clipnotify not found - using polling (run install/install_clipnotify.sh)")
-        log(f"ℹ️  Polling mode: push every {PUSH_INTERVAL}s, pull every {PULL_INTERVAL}s")
+            log("⚠️  clipnotify not found - local clipboard polling (run install/install_clipnotify.sh)")
+        log(f"ℹ️  Local clipboard poll every {PUSH_INTERVAL}s · Remote: long-poll (no pull interval)")
         _client_loop_polling(server_ip)
 
 def _client_loop_event_based(server_ip):
-    """Event-based client loop using clipnotify (Linux only).
-    
-    Two threads:
-    - Main thread: waits for clipboard changes via clipnotify, then pushes
-    - Pull thread: polls server for incoming changes
-    """
+    """Linux + clipnotify: local changes via clipnotify; remote changes via long-poll."""
     print("=" * 50 + "\n")
     
     last_local = clipboard_get()
     last_remote = ""
     stop_event = threading.Event()
+    backoff = min(5.0, max(0.5, PULL_INTERVAL))
     
     def pull_thread():
-        """Background thread to pull from server."""
+        """Background thread: block on /pull_wait until the server revision advances."""
         nonlocal last_remote, last_local
+        last_seen_rev = -1
         while not stop_event.is_set():
             try:
-                remote_clip = _client_pull(server_ip)
-                if remote_clip and remote_clip != last_local and remote_clip != last_remote:
-                    clipboard_set(remote_clip)
+                remote_clip, new_rev = _client_pull_wait(server_ip, last_seen_rev)
+                if new_rev is not None:
+                    last_seen_rev = new_rev
+                if remote_clip is None and new_rev is None:
+                    time.sleep(backoff)
+                    continue
+                if (
+                    remote_clip
+                    and not _clip_sync_equal(remote_clip, last_local)
+                    and not _clip_sync_equal(remote_clip, last_remote)
+                ):
                     last_remote = remote_clip
                     last_local = remote_clip
+                    clipboard_set(remote_clip)
+                    read_back = clipboard_get()
+                    if read_back is not None:
+                        last_local = read_back
                     log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
             except Exception:
-                pass
-            time.sleep(PULL_INTERVAL)
+                time.sleep(backoff)
     
     # Start pull thread
     puller = threading.Thread(target=pull_thread, daemon=True)
@@ -654,7 +769,11 @@ def _client_loop_event_based(server_ip):
         while True:
             if _wait_for_clipboard_change():
                 current = clipboard_get()
-                if current and current != last_local and current != last_remote:
+                if (
+                    current
+                    and not _clip_sync_equal(current, last_local)
+                    and not _clip_sync_equal(current, last_remote)
+                ):
                     try:
                         if _client_push(server_ip, current):
                             last_local = current
@@ -665,43 +784,69 @@ def _client_loop_event_based(server_ip):
         stop_event.set()
 
 def _client_loop_polling(server_ip):
-    """Polling-based client loop (fallback for Windows or when clipnotify unavailable)."""
+    """Fallback: poll local clipboard on ``push_interval``; remote side uses long-poll."""
     print("=" * 50 + "\n")
     
     last_local = clipboard_get()
     last_remote = ""
     last_push_check = 0
-    
-    while True:
-        current_time = time.time()
-        
-        # PUSH: Check local clipboard at configured interval
-        if current_time - last_push_check >= PUSH_INTERVAL:
-            last_push_check = current_time
+    stop_event = threading.Event()
+    backoff = min(5.0, max(0.5, PULL_INTERVAL))
+
+    def pull_thread():
+        nonlocal last_remote, last_local
+        last_seen_rev = -1
+        while not stop_event.is_set():
             try:
-                current_local = clipboard_get()
-                if current_local and current_local != last_local and current_local != last_remote:
-                    time.sleep(0.15)
-                    confirm_local = clipboard_get()
-                    if confirm_local == current_local:
-                        if _client_push(server_ip, current_local):
-                            last_local = current_local
-                            log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
+                remote_clip, new_rev = _client_pull_wait(server_ip, last_seen_rev)
+                if new_rev is not None:
+                    last_seen_rev = new_rev
+                if remote_clip is None and new_rev is None:
+                    time.sleep(backoff)
+                    continue
+                if (
+                    remote_clip
+                    and not _clip_sync_equal(remote_clip, last_local)
+                    and not _clip_sync_equal(remote_clip, last_remote)
+                ):
+                    last_remote = remote_clip
+                    last_local = remote_clip
+                    clipboard_set(remote_clip)
+                    read_back = clipboard_get()
+                    if read_back is not None:
+                        last_local = read_back
+                    log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
             except Exception:
-                pass
-        
-        # PULL: Get remote changes
-        try:
-            remote_clip = _client_pull(server_ip)
-            if remote_clip and remote_clip != last_local and remote_clip != last_remote:
-                clipboard_set(remote_clip)
-                last_remote = remote_clip
-                last_local = remote_clip
-                log(f"📥 RECV from server: {remote_clip[:40].replace(chr(10), ' ')}...")
-        except Exception:
-            pass
-        
-        time.sleep(PULL_INTERVAL)
+                time.sleep(backoff)
+
+    puller = threading.Thread(target=pull_thread, daemon=True)
+    puller.start()
+
+    try:
+        while True:
+            current_time = time.time()
+
+            if current_time - last_push_check >= PUSH_INTERVAL:
+                last_push_check = current_time
+                try:
+                    current_local = clipboard_get()
+                    if (
+                        current_local
+                        and not _clip_sync_equal(current_local, last_local)
+                        and not _clip_sync_equal(current_local, last_remote)
+                    ):
+                        time.sleep(0.15)
+                        confirm_local = clipboard_get()
+                        if confirm_local == current_local:
+                            if _client_push(server_ip, current_local):
+                                last_local = current_local
+                                log(f"📤 SENT to server: {current_local[:40].replace(chr(10), ' ')}...")
+                except Exception:
+                    pass
+
+            time.sleep(0.5)
+    finally:
+        stop_event.set()
 
 def start_client():
     # Check for manual IP in config
@@ -733,7 +878,7 @@ def save_config(updates):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ClipBridge - Cross-platform clipboard sync",
+        description=f"ClipBridge {__version__} - Cross-platform clipboard sync",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -746,6 +891,12 @@ Security Setup (run once on each machine):
   clipbridge --enable-encryption   Enable AES-256 encryption
   clipbridge --show-config         Show current configuration
         """
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"ClipBridge {__version__}",
+        help="Show version and exit",
     )
     parser.add_argument('--server', '-s', action='store_true', help='Run as server')
     parser.add_argument('--client', '-c', action='store_true', help='Run as client')

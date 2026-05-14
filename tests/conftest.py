@@ -11,6 +11,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def reset_clipbridge_server_clipboard():
+    """Reset shared clipboard state between tests (Flask app is module-singleton)."""
+    import clipbridge
+    if hasattr(clipbridge, "clipboard_condition"):
+        with clipbridge.clipboard_condition:
+            clipbridge.shared_clipboard = ""
+            clipbridge.clipboard_rev = 0
+    yield
+
+
 @pytest.fixture
 def mock_clipboard(monkeypatch):
     """Mock clipboard for testing without affecting real clipboard."""
