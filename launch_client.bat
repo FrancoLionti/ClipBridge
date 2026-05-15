@@ -31,7 +31,7 @@ if not exist ".venv\Scripts\python.exe" (
   )
 )
 
-echo [INFO] Dependencias: flask, requests, pyperclip ...
+echo [INFO] Dependencias: flask, requests, pyperclip, cryptography ...
 ".venv\Scripts\pip.exe" install -q -r "%~dp0requirements.txt"
 if errorlevel 1 (
   echo [ERROR] pip install fallo.

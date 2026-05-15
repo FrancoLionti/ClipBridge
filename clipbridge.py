@@ -4,7 +4,7 @@ ClipBridge - Cross-platform clipboard synchronization
 https://github.com/FrancoLionti/ClipBridge
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 import argparse
 import json
@@ -154,6 +154,53 @@ class SecurityManager:
 
 # Initialize security manager
 security = SecurityManager(SECRET_KEY, ENCRYPTION_ENABLED)
+
+# Stable ciphertext for a given (rev, plaintext) so long-poll clients don't see a new token every request.
+_enc_wire_lock = threading.Lock()
+_enc_wire_cache_key = None  # (rev, plain)
+_enc_wire_cache_val = None
+
+
+def _payload_looks_fernet_token(data: str) -> bool:
+    """Heuristic: Fernet wire tokens are long urlsafe-base64 strings (version 0x80 → often 'gAAAA…')."""
+    if not data:
+        return False
+    s = data.strip()
+    if len(s) < 32:
+        return False
+    if not s.startswith("gAAAA"):
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=")
+    return all(c in allowed for c in s)
+
+
+def _encrypted_payload_for_response(plain_text: str, rev: int) -> str:
+    """Return wire payload; encryption is stable until (rev, plaintext) changes."""
+    global _enc_wire_cache_key, _enc_wire_cache_val
+    if not security.encryption_enabled or app.config.get("TESTING", False):
+        return plain_text
+    key = (rev, plain_text)
+    with _enc_wire_lock:
+        if key == _enc_wire_cache_key:
+            return _enc_wire_cache_val
+        _enc_wire_cache_key = key
+        _enc_wire_cache_val = security.encrypt(plain_text)
+        return _enc_wire_cache_val
+
+
+def ensure_crypto_if_encryption_configured():
+    """Exit with a clear message if config requests encryption but cryptography is missing."""
+    if not bool(CONFIG.get("encryption_enabled", False) and CONFIG.get("secret_key")):
+        return
+    if CRYPTO_AVAILABLE:
+        return
+    print(
+        "ERROR: config.json has encryption_enabled=true but the 'cryptography' package is not installed.\n"
+        "  Fix: pip install cryptography   (use the same venv as ClipBridge)\n"
+        "  Or set encryption_enabled to false on this machine.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # Rate limiting
 request_counts = defaultdict(list)
@@ -419,12 +466,13 @@ def push():
     global shared_clipboard, last_update_source, clipboard_rev
     incoming = request.data.decode('utf-8')
     
-    # Decrypt if encryption is enabled (skip in test mode)
+    # Decrypt only if body looks like a Fernet token (mixed clients / plaintext push).
     if security.encryption_enabled and not app.config.get('TESTING', False):
-        decrypted = security.decrypt(incoming)
-        if decrypted != incoming:  # Decryption happened
-            incoming = decrypted
-            log(f"🔓 Decrypted incoming data")
+        if _payload_looks_fernet_token(incoming):
+            decrypted = security.decrypt(incoming)
+            if decrypted != incoming:
+                incoming = decrypted
+                log("🔓 Decrypted incoming data")
     
     with clipboard_condition:
         if incoming != shared_clipboard:
@@ -442,10 +490,10 @@ def push():
 def pull():
     with clipboard_condition:
         data = shared_clipboard
+        rev = clipboard_rev
     
-    # Encrypt if encryption is enabled (skip in test mode)
     if security.encryption_enabled and not app.config.get('TESTING', False):
-        data = security.encrypt(data)
+        data = _encrypted_payload_for_response(data, rev)
     
     return data
 
@@ -486,7 +534,7 @@ def pull_wait():
             rev_out = clipboard_rev
 
     if security.encryption_enabled and not app.config.get("TESTING", False):
-        payload = security.encrypt(payload)
+        payload = _encrypted_payload_for_response(payload, rev_out)
 
     body = payload if isinstance(payload, (bytes, bytearray)) else (payload or "")
     return Response(
@@ -532,6 +580,7 @@ def server_clipboard_monitor():
 def start_server():
     global shared_clipboard, clipboard_rev
     
+    ensure_crypto_if_encryption_configured()
     local_ip = get_local_ip()
     
     print("\n" + "=" * 50)
@@ -679,6 +728,7 @@ def client_sync_loop(server_ip):
     new, or a timeout). No periodic GET storm to ``/pull``.
     """
     
+    ensure_crypto_if_encryption_configured()
     print("\n" + "=" * 50)
     print("   CLIPBRIDGE CLIENT")
     print("=" * 50)

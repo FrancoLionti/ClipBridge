@@ -22,7 +22,7 @@ if [ ! -d "$VENV" ]; then
     fi
 fi
 
-echo "📦 Ensuring dependencies (flask, requests, pyperclip)..."
+echo "📦 Ensuring dependencies (flask, requests, pyperclip, cryptography)..."
 "$VENV/bin/pip" install -q -r "$REQ" || exit 1
 
 echo "🚀 Starting ClipBridge Client..."
