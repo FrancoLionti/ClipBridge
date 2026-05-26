@@ -43,7 +43,7 @@ echo.
 echo ============================================
 echo   ClipBridge CLIENT
 echo ============================================
-echo Opcional: lanzador interactivo — launch_client.bat on
+echo Opcional: lanzador interactivo — launch_client.bat on   (o "off" desde otra consola)
 echo (^sync en segundo plano y consola clipbridge^>)
 echo El server debe ser la misma version ^(/pull_wait^).
 echo Ctrl+C para detener.

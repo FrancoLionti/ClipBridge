@@ -80,7 +80,13 @@ The client will automatically discover the server on your local network.
 ```bash
 clipbridge client on
 ```
-Optional explicit server: `clipbridge client on --ip 192.168.1.10`. Commands: `help`, `status`, `exit`.
+Optional explicit server: `clipbridge client on --ip 192.168.1.10`. Commands: `help`, `status`, `off` / `exit`.
+
+From another terminal on the **same machine** (same config directory as the install), you can stop the interactive session without Ctrl+C:
+
+```bash
+clipbridge client off
+```
 
 From a repo checkout without PATH install:
 

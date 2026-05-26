@@ -28,5 +28,6 @@ echo "📦 Ensuring dependencies (flask, requests, pyperclip, cryptography)..."
 echo "🚀 Starting ClipBridge Client..."
 # Usage: ./launch_client.sh           → client (foreground sync)
 #        ./launch_client.sh on       → client on (sync + clipbridge> shell)
+#        ./launch_client.sh off      → client off (stop interactive on this PC)
 #        ./launch_client.sh on --ip 192.168.1.5
 exec "$VENV/bin/python" "$DIR/clipbridge.py" client "$@"

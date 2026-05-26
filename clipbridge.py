@@ -4,12 +4,14 @@ ClipBridge - Cross-platform clipboard synchronization
 https://github.com/FrancoLionti/ClipBridge
 """
 
-__version__ = "2.0.3"
+__version__ = "2.0.4"
 
 import argparse
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -85,6 +87,136 @@ def resolve_config_file(
 
 
 CONFIG_FILE = resolve_config_file(SCRIPT_DIR)
+
+
+def _interactive_pid_path() -> Path:
+    """File written while ``clipbridge client on`` runs; removed on clean exit."""
+    return CONFIG_FILE.parent / "interactive_client.pid"
+
+
+def _interactive_pid_record() -> None:
+    path = _interactive_pid_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _interactive_pid_clear() -> None:
+    try:
+        _interactive_pid_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            ).stdout
+        except OSError:
+            return False
+        if not out or "no tasks" in out.lower():
+            return False
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_cmdline_for_verify(pid: int) -> str:
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return raw.replace(b"\0", b" ").decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter "
+                    f"'ProcessId = {pid}' -ErrorAction SilentlyContinue)"
+                    ".CommandLine",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            ).stdout.strip()
+            return out
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return ""
+
+
+def _pid_targets_clipbridge(pid: int) -> bool:
+    hay = _pid_cmdline_for_verify(pid).lower()
+    if not hay:
+        return False
+    return "clipbridge" in hay or "clipbridge.py" in hay
+
+
+def stop_remote_interactive_client() -> None:
+    """Tell a running ``clipbridge client on`` (same machine, same config dir) to stop.
+
+    Sends SIGINT on Unix (same as Ctrl+C in the REPL). On Windows uses ``taskkill`` without ``/F``.
+    """
+    path = _interactive_pid_path()
+    if not path.is_file():
+        log("❌ No interactive client PID file — nothing to stop. Start one with: clipbridge client on")
+        return
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        log("⚠️  Clearing invalid PID file.")
+        path.unlink(missing_ok=True)
+        return
+
+    if not _process_exists(pid):
+        log("⚠️  Process is gone — removing stale PID file.")
+        path.unlink(missing_ok=True)
+        return
+
+    if not _pid_targets_clipbridge(pid):
+        log(
+            f"⚠️  Refusing to signal PID {pid} (does not look like ClipBridge). "
+            f"Delete {path} manually if it is stuck."
+        )
+        return
+
+    log(f"🛑 Stopping interactive client (PID {pid})…")
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid)],
+                capture_output=True,
+                timeout=45,
+                check=False,
+            )
+        else:
+            os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        log("👋 Interactive client already exited.")
+    except Exception as e:
+        log(f"❌ Could not signal process: {e}")
+        return
+    path.unlink(missing_ok=True)
+
 
 DEFAULT_CONFIG = {
     "server_ip": None,
@@ -298,8 +430,6 @@ def require_auth(f):
 # ============================================================
 # CLIPBOARD ABSTRACTION (Linux-safe)
 # ============================================================
-
-import subprocess
 
 def _linux_get_clipboard():
     """Get clipboard on Linux using xclip directly (less intrusive than pyperclip)."""
@@ -994,16 +1124,20 @@ def run_interactive_client(server_ip):
         log("❌ Client thread stopped (could not connect or config error).")
         return
 
-    print()
-    print("=" * 50)
-    print("   CLIPBRIDGE INTERACTIVE CLIENT")
-    print("=" * 50)
-    print(f"   Server: {server_ip}:{PORT}")
-    print("   Sync runs in the background. Type 'help' for commands.")
-    print("=" * 50)
-    print()
+    _interactive_pid_record()
+    try:
+        print()
+        print("=" * 50)
+        print("   CLIPBRIDGE INTERACTIVE CLIENT")
+        print("=" * 50)
+        print(f"   Server: {server_ip}:{PORT}")
+        print("   Sync runs in the background. Type 'help' for commands.")
+        print("=" * 50)
+        print()
 
-    _interactive_client_repl(stop_event, sync_thread, server_ip)
+        _interactive_client_repl(stop_event, sync_thread, server_ip)
+    finally:
+        _interactive_pid_clear()
 
 
 def _interactive_client_repl(stop_event, sync_thread, server_ip):
@@ -1023,7 +1157,7 @@ def _interactive_client_repl(stop_event, sync_thread, server_ip):
 
         if cmd in ("",):
             continue
-        if cmd in ("exit", "quit", "q"):
+        if cmd in ("exit", "quit", "q", "off"):
             log("🛑 Stopping sync…")
             stop_event.set()
             sync_thread.join(timeout=20)
@@ -1037,7 +1171,8 @@ def _interactive_client_repl(stop_event, sync_thread, server_ip):
                 "\nCommands:\n"
                 "  help     — this text\n"
                 "  status   — ping the server (/helo)\n"
-                "  exit     — stop sync and leave (also Ctrl+D, Ctrl+C)\n"
+                "  off      — stop sync and leave (same as exit / Ctrl+C)\n"
+                "  exit     — same as off (also Ctrl+D)\n"
             )
             continue
         if cmd == "status":
@@ -1088,6 +1223,7 @@ Examples:
   clipbridge server              Start as server
   clipbridge client              Start as client (auto-discover)
   clipbridge client on           Client + interactive shell (commands while syncing)
+  clipbridge client off          Stop a running interactive client (other terminal)
   clipbridge --server            Same as: clipbridge server
   clipbridge --client            Same as: clipbridge client
   clipbridge                     Auto-detect mode
@@ -1123,17 +1259,17 @@ Security Setup (run once on each machine):
     )
     p_client_cmd = subparsers.add_parser(
         'client',
-        help='Run as client (same as --client). Use positional "on" for interactive CLI.',
+        help='Run as client (same as --client). Use "on" / "off" for interactive control.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Try: clipbridge client on",
+        epilog="Try: clipbridge client on   |   clipbridge client off",
     )
     p_client_cmd.add_argument(
         'interactive',
         nargs='?',
-        choices=['on'],
+        choices=['on', 'off'],
         default=None,
-        metavar='on',
-        help='"on": sync runs in background; you stay at clipbridge>',
+        metavar='on|off',
+        help='"on": REPL + background sync; "off": stop that session (same PC, see PID file)',
     )
     p_client_cmd.add_argument('--ip', type=str, help='Server IP (skip discovery)')
     
@@ -1183,6 +1319,8 @@ Security Setup (run once on each machine):
     if subcmd == 'client':
         if args.interactive == 'on':
             start_client(cmdline_ip=args.ip, interactive_shell=True)
+        elif args.interactive == 'off':
+            stop_remote_interactive_client()
         elif args.ip:
             client_sync_loop(args.ip)
         else:
