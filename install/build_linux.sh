@@ -41,8 +41,8 @@ if [ -f "dist/clipbridge" ]; then
     echo "  $(pwd)/dist/clipbridge"
     echo ""
     echo "Usage:"
-    echo "  ./dist/clipbridge --server"
-    echo "  ./dist/clipbridge --client"
+    echo "  ./dist/clipbridge server"
+    echo "  ./dist/clipbridge client"
     echo "============================================"
 else
     echo "ERROR: Build failed"

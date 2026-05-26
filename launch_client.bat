@@ -43,12 +43,14 @@ echo.
 echo ============================================
 echo   ClipBridge CLIENT
 echo ============================================
+echo Opcional: lanzador interactivo — launch_client.bat on
+echo (^sync en segundo plano y consola clipbridge^>)
 echo El server debe ser la misma version ^(/pull_wait^).
 echo Ctrl+C para detener.
 echo ============================================
 echo.
 
-".venv\Scripts\python.exe" "%~dp0clipbridge.py" --client
+".venv\Scripts\python.exe" "%~dp0clipbridge.py" client %*
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo [ERROR] Codigo de salida %RC%

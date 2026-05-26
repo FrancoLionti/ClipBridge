@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipbridge-sync"
+description = "Cross-platform clipboard synchronization over the local network (Windows & Linux)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dynamic = ["version"]
+dependencies = [
+    "flask>=2.0.0",
+    "requests>=2.25.0",
+    "pyperclip>=1.8.0",
+    "cryptography>=41.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/FrancoLionti/ClipBridge"
+
+[project.scripts]
+clipbridge = "clipbridge:main"
+
+[tool.setuptools]
+py-modules = ["clipbridge"]
+
+[tool.setuptools.dynamic]
+version = {attr = "clipbridge.__version__"}

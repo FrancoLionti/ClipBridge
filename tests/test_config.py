@@ -51,3 +51,42 @@ class TestLoadConfig:
         import clipbridge
         assert 'pull_interval' in clipbridge.DEFAULT_CONFIG
         assert isinstance(clipbridge.DEFAULT_CONFIG['pull_interval'], (int, float))
+
+    def test_resolve_config_dev_clone_uses_repo_file(self):
+        import clipbridge
+        from pathlib import Path
+        root = Path("/home/user/Projects/ClipBridge")
+        assert clipbridge.resolve_config_file(root, {}) == root / "config.json"
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="XDG default path is only used for non-Windows in _user_default_config_file",
+    )
+    def test_resolve_config_installed_uses_xdg_on_linux(self, monkeypatch):
+        import clipbridge
+        import os
+        monkeypatch.delenv("CLIPBRIDGE_CONFIG", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", "/xdg/conf")
+        from pathlib import Path
+        root = Path("/usr/lib/python3.12/site-packages")
+        fp = clipbridge.resolve_config_file(root, os.environ)
+        assert fp == Path("/xdg/conf/clipbridge/config.json")
+
+    def test_resolve_config_env_file_overrides(self, monkeypatch, tmp_path):
+        import clipbridge
+        import os
+        target = tmp_path / "custom.json"
+        monkeypatch.setenv("CLIPBRIDGE_CONFIG", str(target))
+        from pathlib import Path
+        root = Path("/usr/lib/python3.12/site-packages")
+        assert clipbridge.resolve_config_file(root, os.environ) == target
+
+    def test_resolve_config_env_dir_overrides(self, monkeypatch, tmp_path):
+        import clipbridge
+        import os
+        d = tmp_path / "clipconf"
+        d.mkdir()
+        monkeypatch.setenv("CLIPBRIDGE_CONFIG", str(d))
+        from pathlib import Path
+        root = Path("/usr/lib/python3.12/site-packages")
+        assert clipbridge.resolve_config_file(root, os.environ) == d / "config.json"

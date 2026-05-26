@@ -24,7 +24,7 @@ echo Creating hidden launcher...
 set VBS_FILE=%SCRIPT_DIR%\clipbridge_hidden.vbs
 
 echo Set WshShell = CreateObject("WScript.Shell") > "%VBS_FILE%"
-echo WshShell.Run chr(34) ^& "%SCRIPT_DIR%\clipbridge.py" ^& chr(34) ^& " --server", 0 >> "%VBS_FILE%"
+echo WshShell.Run chr(34) ^& "%SCRIPT_DIR%\clipbridge.py" ^& chr(34) ^& " server", 0 >> "%VBS_FILE%"
 echo Set WshShell = Nothing >> "%VBS_FILE%"
 
 :: Create scheduled task

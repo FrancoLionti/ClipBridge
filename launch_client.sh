@@ -26,4 +26,7 @@ echo "📦 Ensuring dependencies (flask, requests, pyperclip, cryptography)..."
 "$VENV/bin/pip" install -q -r "$REQ" || exit 1
 
 echo "🚀 Starting ClipBridge Client..."
-"$VENV/bin/python" "$DIR/clipbridge.py" --client
+# Usage: ./launch_client.sh           → client (foreground sync)
+#        ./launch_client.sh on       → client on (sync + clipbridge> shell)
+#        ./launch_client.sh on --ip 192.168.1.5
+exec "$VENV/bin/python" "$DIR/clipbridge.py" client "$@"

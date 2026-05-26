@@ -21,3 +21,6 @@ Thumbs.db
 
 # PyInstaller / local builds
 dist/
+build/
+*.egg-info/
+_test_site/

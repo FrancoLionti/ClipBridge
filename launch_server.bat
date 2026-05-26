@@ -50,7 +50,7 @@ echo Ctrl+C para detener.
 echo ============================================
 echo.
 
-".venv\Scripts\python.exe" "%~dp0clipbridge.py" --server
+".venv\Scripts\python.exe" "%~dp0clipbridge.py" server
 set "RC=%ERRORLEVEL%"
 echo.
 if not "%RC%"=="0" echo [ERROR] Codigo de salida %RC%

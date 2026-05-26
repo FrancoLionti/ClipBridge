@@ -4,7 +4,7 @@ ClipBridge - Cross-platform clipboard synchronization
 https://github.com/FrancoLionti/ClipBridge
 """
 
-__version__ = "2.0.1"
+__version__ = "2.0.3"
 
 import argparse
 import json
@@ -13,8 +13,10 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # ============================================================
 # LINUX: Prevent ghost windows from clipboard access
@@ -37,8 +39,52 @@ from flask import Flask, request, abort, Response
 # CONFIGURATION
 # ============================================================
 
-SCRIPT_DIR = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _path_looks_installed(package_root: Path) -> bool:
+    """True when the package lives under site-packages/dist-packages (pip install)."""
+    if getattr(sys, "frozen", False):
+        return True  # PyInstaller / frozen: never write beside the exe
+    parts = package_root.parts
+    return "site-packages" in parts or "dist-packages" in parts
+
+
+def _user_default_config_file(environ: Mapping[str, str]) -> Path:
+    """Per-user config path (used when ClipBridge is installed as a Python package)."""
+    if sys.platform.startswith("win"):
+        base_raw = environ.get("LOCALAPPDATA", "").strip()
+        base = Path(base_raw).expanduser() if base_raw else Path.home() / "AppData" / "Local"
+        return base / "clipbridge" / "config.json"
+    if sys.platform == "darwin":
+        home = Path.home()
+        return home / "Library" / "Application Support" / "clipbridge" / "config.json"
+    xdg = (environ.get("XDG_CONFIG_HOME") or "").strip()
+    root = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return root / "clipbridge" / "config.json"
+
+
+def resolve_config_file(
+    package_root: Path,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    """Where to store config.json: env override → repo-local (dev clone) → XDG-ish user dir."""
+
+    envmap = environ if environ is not None else os.environ
+    raw = (envmap.get("CLIPBRIDGE_CONFIG") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.is_dir():
+            return p / "config.json"
+        return p
+    if not _path_looks_installed(package_root):
+        return package_root / "config.json"
+    return _user_default_config_file(envmap)
+
+
+CONFIG_FILE = resolve_config_file(SCRIPT_DIR)
 
 DEFAULT_CONFIG = {
     "server_ip": None,
@@ -363,16 +409,35 @@ def _has_clipnotify():
     except Exception:
         return False
 
-def _wait_for_clipboard_change():
+def _wait_for_clipboard_change(stop_event=None):
     """Block until clipboard changes (Linux only, requires clipnotify).
-    
-    Returns True if clipboard changed, False on error/timeout.
+
+    If ``stop_event`` is set, the waiting ``clipnotify`` child is terminated and
+    this returns False so the client loop can exit promptly (e.g. interactive mode).
+
+    Returns True if clipboard changed, False on error or stop.
     """
+    if stop_event and stop_event.is_set():
+        return False
     try:
-        # clipnotify blocks until X selection changes, then exits
-        result = subprocess.run(['clipnotify'], timeout=30)
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
+        proc = subprocess.Popen(
+            ["clipnotify"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        while True:
+            if stop_event and stop_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return False
+            code = proc.poll()
+            if code is not None:
+                return code == 0
+            time.sleep(0.2)
+    except FileNotFoundError:
         return False
     except Exception:
         return False
@@ -384,9 +449,14 @@ USE_CLIPNOTIFY = sys.platform.startswith('linux') and _has_clipnotify()
 # LOGGING
 # ============================================================
 
+_log_lock = threading.Lock()
+
+
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+    line = f"[{ts}] {msg}"
+    with _log_lock:
+        print(line, flush=True)
 
 # ============================================================
 # AUTO-DISCOVERY
@@ -717,7 +787,7 @@ def _client_pull_wait(server_ip, since_rev):
 
     return data, new_rev
 
-def client_sync_loop(server_ip):
+def client_sync_loop(server_ip, stop_event=None):
     """Main client loop: push local changes, pull remote changes.
 
     Local clipboard:
@@ -726,9 +796,13 @@ def client_sync_loop(server_ip):
 
     Remote clipboard: long-poll ``/pull_wait`` (blocks until the server has something
     new, or a timeout). No periodic GET storm to ``/pull``.
+
+    Pass ``stop_event`` to interrupt the loop (e.g. ``clipbridge client on`` REPL ``exit``).
     """
-    
+
     ensure_crypto_if_encryption_configured()
+    if stop_event is None:
+        stop_event = threading.Event()
     print("\n" + "=" * 50)
     print("   CLIPBRIDGE CLIENT")
     print("=" * 50)
@@ -767,20 +841,19 @@ def client_sync_loop(server_ip):
     if USE_CLIPNOTIFY:
         log("🎯 Local clipboard: clipnotify (event-based, no polling)")
         log("📡 Remote clipboard: long-poll /pull_wait (blocked until server updates)")
-        _client_loop_event_based(server_ip)
+        _client_loop_event_based(server_ip, stop_event)
     else:
         if sys.platform.startswith('linux'):
             log("⚠️  clipnotify not found - local clipboard polling (run install/install_clipnotify.sh)")
         log(f"ℹ️  Local clipboard poll every {PUSH_INTERVAL}s · Remote: long-poll (no pull interval)")
-        _client_loop_polling(server_ip)
+        _client_loop_polling(server_ip, stop_event)
 
-def _client_loop_event_based(server_ip):
+def _client_loop_event_based(server_ip, stop_event):
     """Linux + clipnotify: local changes via clipnotify; remote changes via long-poll."""
     print("=" * 50 + "\n")
     
     last_local = clipboard_get()
     last_remote = ""
-    stop_event = threading.Event()
     backoff = min(5.0, max(0.5, PULL_INTERVAL))
     
     def pull_thread():
@@ -813,11 +886,11 @@ def _client_loop_event_based(server_ip):
     # Start pull thread
     puller = threading.Thread(target=pull_thread, daemon=True)
     puller.start()
-    
+
     # Main loop: wait for clipboard changes
     try:
-        while True:
-            if _wait_for_clipboard_change():
+        while not stop_event.is_set():
+            if _wait_for_clipboard_change(stop_event):
                 current = clipboard_get()
                 if (
                     current
@@ -833,14 +906,13 @@ def _client_loop_event_based(server_ip):
     finally:
         stop_event.set()
 
-def _client_loop_polling(server_ip):
+def _client_loop_polling(server_ip, stop_event):
     """Fallback: poll local clipboard on ``push_interval``; remote side uses long-poll."""
     print("=" * 50 + "\n")
     
     last_local = clipboard_get()
     last_remote = ""
     last_push_check = 0
-    stop_event = threading.Event()
     backoff = min(5.0, max(0.5, PULL_INTERVAL))
 
     def pull_thread():
@@ -873,7 +945,7 @@ def _client_loop_polling(server_ip):
     puller.start()
 
     try:
-        while True:
+        while not stop_event.is_set():
             current_time = time.time()
 
             if current_time - last_push_check >= PUSH_INTERVAL:
@@ -898,21 +970,101 @@ def _client_loop_polling(server_ip):
     finally:
         stop_event.set()
 
-def start_client():
-    # Check for manual IP in config
-    server_ip = CONFIG.get("server_ip")
-    
+
+def _resolve_client_server_ip(cmdline_ip=None):
+    """Return server IP from CLI override, config, or UDP discovery."""
+    server_ip = cmdline_ip or CONFIG.get("server_ip")
     if not server_ip:
-        # Try auto-discovery
         server_ip = discover_server(timeout=5)
-    
+    return server_ip
+
+
+def run_interactive_client(server_ip):
+    """Run sync in a background thread and accept commands on stdin (``client on``)."""
+    stop_event = threading.Event()
+    sync_thread = threading.Thread(
+        target=client_sync_loop,
+        args=(server_ip, stop_event),
+        name="ClipBridgeSync",
+        daemon=False,
+    )
+    sync_thread.start()
+    time.sleep(0.4)
+    if not sync_thread.is_alive():
+        log("❌ Client thread stopped (could not connect or config error).")
+        return
+
+    print()
+    print("=" * 50)
+    print("   CLIPBRIDGE INTERACTIVE CLIENT")
+    print("=" * 50)
+    print(f"   Server: {server_ip}:{PORT}")
+    print("   Sync runs in the background. Type 'help' for commands.")
+    print("=" * 50)
+    print()
+
+    _interactive_client_repl(stop_event, sync_thread, server_ip)
+
+
+def _interactive_client_repl(stop_event, sync_thread, server_ip):
+    """Simple command loop; sync logs may appear between prompts."""
+    while True:
+        try:
+            line = input("clipbridge> ")
+        except EOFError:
+            print()
+            line = "exit"
+        except KeyboardInterrupt:
+            print()
+            line = "exit"
+
+        parts = line.strip().split()
+        cmd = parts[0].lower() if parts else ""
+
+        if cmd in ("",):
+            continue
+        if cmd in ("exit", "quit", "q"):
+            log("🛑 Stopping sync…")
+            stop_event.set()
+            sync_thread.join(timeout=20)
+            if sync_thread.is_alive():
+                log("⚠️  Sync thread did not exit in time; exiting anyway.")
+            else:
+                log("👋 Sync stopped.")
+            return
+        if cmd in ("help", "?", "h"):
+            print(
+                "\nCommands:\n"
+                "  help     — this text\n"
+                "  status   — ping the server (/helo)\n"
+                "  exit     — stop sync and leave (also Ctrl+D, Ctrl+C)\n"
+            )
+            continue
+        if cmd == "status":
+            try:
+                resp = requests.get(f"http://{server_ip}:{PORT}/helo", timeout=3)
+                ok = resp.status_code == 200
+                print(f"  Server: {'OK — ' + resp.text if ok else 'HTTP ' + str(resp.status_code)}")
+            except Exception as e:
+                print(f"  Server: unreachable ({type(e).__name__}: {e})")
+            continue
+
+        print(f"  Unknown command: {cmd!r}. Type 'help'.")
+
+
+def start_client(cmdline_ip=None, interactive_shell=False):
+    server_ip = _resolve_client_server_ip(cmdline_ip)
+
     if not server_ip:
         log("❌ No server found. Options:")
-        log("   1. Start a server: python clipbridge.py --server")
+        log("   1. Start a server: python clipbridge.py server")
         log("   2. Set server_ip in config.json")
         return
-    
-    client_sync_loop(server_ip)
+
+    if interactive_shell:
+        run_interactive_client(server_ip)
+    else:
+        client_sync_loop(server_ip)
 
 # ============================================================
 # MAIN
@@ -922,6 +1074,7 @@ def save_config(updates):
     """Update and save config file."""
     config = load_config()
     config.update(updates)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=4)
     return config
@@ -932,9 +1085,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  clipbridge --server              Start as server
-  clipbridge --client              Start as client (auto-discover)
-  clipbridge                       Auto-detect mode
+  clipbridge server              Start as server
+  clipbridge client              Start as client (auto-discover)
+  clipbridge client on           Client + interactive shell (commands while syncing)
+  clipbridge --server            Same as: clipbridge server
+  clipbridge --client            Same as: clipbridge client
+  clipbridge                     Auto-detect mode
 
 Security Setup (run once on each machine):
   clipbridge --set-secret KEY      Set shared secret for authentication
@@ -959,6 +1115,27 @@ Security Setup (run once on each machine):
                         help='Disable encryption')
     parser.add_argument('--show-config', action='store_true',
                         help='Show current configuration')
+
+    subparsers = parser.add_subparsers(dest='subcmd', metavar='COMMAND')
+    subparsers.add_parser(
+        'server',
+        help='Run as server (same as --server)',
+    )
+    p_client_cmd = subparsers.add_parser(
+        'client',
+        help='Run as client (same as --client). Use positional "on" for interactive CLI.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Try: clipbridge client on",
+    )
+    p_client_cmd.add_argument(
+        'interactive',
+        nargs='?',
+        choices=['on'],
+        default=None,
+        metavar='on',
+        help='"on": sync runs in background; you stay at clipbridge>',
+    )
+    p_client_cmd.add_argument('--ip', type=str, help='Server IP (skip discovery)')
     
     args = parser.parse_args()
     
@@ -998,7 +1175,20 @@ Security Setup (run once on each machine):
     
     # Override from config
     config_mode = CONFIG.get("mode", "auto")
-    
+    subcmd = getattr(args, "subcmd", None)
+
+    if subcmd == 'server':
+        start_server()
+        return
+    if subcmd == 'client':
+        if args.interactive == 'on':
+            start_client(cmdline_ip=args.ip, interactive_shell=True)
+        elif args.ip:
+            client_sync_loop(args.ip)
+        else:
+            start_client()
+        return
+
     if args.server:
         start_server()
     elif args.client:
