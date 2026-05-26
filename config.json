@@ -5,7 +5,7 @@
     "mode": "auto",
     "push_interval": 3.0,
     "pull_interval": 1.5,
-    "secret_key": "mondongoRACING123",
-    "encryption_enabled": true,
+    "secret_key": null,
+    "encryption_enabled": false,
     "rate_limit": 10
 }

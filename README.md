@@ -2,13 +2,16 @@
 
 Cross-platform clipboard synchronization between Windows and Linux machines on the same network.
 
-**Current release:** 2.0 (`main`). To go back to the 1.0 line: `git fetch origin && git checkout v1.0.0` (same client/server version on all machines).
+Repository: **[github.com/FrancoLionti/ClipBridge](https://github.com/FrancoLionti/ClipBridge)**
+
+**Current release:** **2.0.3** on branch `main` (also shown by `clipbridge --version`). Pre-release (“nightly”) builds on GitHub use tags like **`v2.0.3-nightly`** until you publish **v2.0.3** as stable. To go back to the 1.0 line: `git fetch origin && git checkout v1.0.0` (same client/server version on all machines).
 
 ## Features
 - 🔄 **Bi-directional sync**: Copy on one PC, paste on another
-- 🔍 **Auto-discovery**: No manual IP configuration needed
-- 🚀 **Lightweight**: Pure Python, minimal dependencies
-- ⚡ **Fast**: Sub-second sync times
+- 🔍 **Auto-discovery**: No manual IP configuration needed (UDP; configurable port)
+- 🚀 **Lightweight**: Pure Python, minimal runtime dependencies ([`pyproject.toml`](pyproject.toml))
+- ⚡ **Low latency**: Long-polling + tunable intervals in `config.json`
+- 🔐 **Optional security**: Shared-secret HMAC authentication, payload encryption (`cryptography`), and per‑IP rate limiting
 
 ## Quick Start
 
@@ -64,6 +67,8 @@ clipbridge server
 
 (`python clipbridge.py --server` / `clipbridge --server` are equivalent.)
 
+Show the installed version: `clipbridge --version`.
+
 **On other PCs (Clients):**
 ```bash
 clipbridge client
@@ -100,30 +105,63 @@ You can copy a shortcut to `launch_server.bat` onto the desktop; keep the shortc
 1. Run `install/windows_startup.bat` as Administrator
 2. Or manually add to Task Scheduler
 
-### Ubuntu/Linux (system-wide unit or helper script)
-Automated installer (installs the `clipbridge` CLI with `pip --user`, then wires systemd **user** service):
+### Ubuntu/Linux (`linux_setup.sh` — recommended)
+
+Installs the `clipbridge` CLI with `pip install --user`, optional clipboard packages (see below), and a **systemd user** unit (`~/.config/systemd/user/clipbridge.service`) so ClipBridge starts with your graphical session:
+
 ```bash
 cd /path/to/ClipBridge/install
 chmod +x linux_setup.sh
 ./linux_setup.sh
 ```
-Manual systemd (edit paths and **`ExecStart`** to your `which clipbridge`):
+
+Manage it with: `systemctl --user enable|stop|status clipbridge.service` · logs: `journalctl --user -u clipbridge -f`
+
+### Linux: manual systemd (**system-wide**)
+
+The [`install/clipbridge.service`](install/clipbridge.service) file shipped in the repo uses the placeholder **`CLIPBRIDGE_EXEC`**. Substitute your real CLI path **before** enabling the unit:
+
 ```bash
-sudo cp install/clipbridge.service /etc/systemd/system/
-sudo systemctl enable clipbridge
-sudo systemctl start clipbridge
+EXEC="$(command -v clipbridge)"   # e.g. after pip install --user
+sudo sed "s|CLIPBRIDGE_EXEC|$EXEC|g" install/clipbridge.service | sudo tee /etc/systemd/system/clipbridge.service >/dev/null
+# For a system unit, add User=youruser (and DISPLAY/session details) under [Service] if needed — see comments in the unit file.
+sudo systemctl daemon-reload
+sudo systemctl enable --now clipbridge.service
 ```
 
 ## Configuration
-Edit `config.json` (see table above for its path) to manually set:
-- `server_ip`: Override auto-discovery
-- `port`: Change default port (5000)
-- `mode`: Force "server" or "client"
+
+Edit `config.json` (paths in the table above). **Never commit real `secret_key` values** — use fresh keys via the CLI below or keep overrides in an untracked file and point **`CLIPBRIDGE_CONFIG`** at it.
+
+**Network / mode**
+- `server_ip`: Override auto-discovery (client)
+- `port`: HTTP API port (**TCP**, default **5000**)
+- `discovery_port`: Broadcast / discovery (**UDP**, default **5001**)
+- `mode`: `"auto"`, `"server"`, or `"client"`
+
+**Sync tuning**
+- `push_interval`: How often the client pushes local clipboard changes (seconds)
+- `pull_interval`: Poll / long‑poll pacing toward the server (seconds)
+
+**Optional security**
+- `secret_key`: Shared secret (**same on server and clients**). When unset, authentication is disabled.
+- `encryption_enabled`: Encrypt payloads over the network (requires `secret_key` and the `cryptography` package).
+- `rate_limit`: Max HTTP requests per second **per IP** on the server (abuse mitigation).
+
+CLI helpers (**run once on each machine with the same secret**):
+
+```bash
+clipbridge --set-secret YOUR_SHARED_SECRET
+clipbridge --enable-encryption       # optional; needs cryptography installed
+clipbridge --disable-encryption      # turn encryption off without editing JSON
+clipbridge --show-config
+```
 
 ## Requirements
-- Python 3.8+
+- Python 3.8+ (see [`pyproject.toml`](pyproject.toml))
 - Same local network (LAN)
-- Port 5000 (TCP) and 5001 (UDP) open
+- Firewall / router: **TCP** `port` (default 5000) and **UDP** `discovery_port` (default 5001) reachable between peers
+- **Linux clipboard**: **X11** — `xclip` or `xsel`; **Wayland** — `wl-clipboard` (`wl-copy` / `wl-paste`). The setup script tries to install these on Debian/Ubuntu when missing.
 
 ## License
 MIT

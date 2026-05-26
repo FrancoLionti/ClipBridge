@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/FrancoLionti/ClipBridge"
 Repository = "https://github.com/FrancoLionti/ClipBridge"
 
 [project.scripts]
